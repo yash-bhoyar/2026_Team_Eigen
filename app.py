@@ -25,8 +25,28 @@ from detection import (
     RIGHT_KNEE
 )
 import uuid
+import threading
+import pyttsx3
 from reba_scoring import evaluate_reba_score
 from firebase_db import get_firebase_status, log_incident_to_firestore
+
+
+def _speak_worker(message_text: str):
+    """Worker function executed in a background thread to synthesize speech without blocking UI."""
+    try:
+        engine = pyttsx3.init()
+        engine.say(message_text)
+        engine.runAndWait()
+        engine.stop()
+    except Exception as e:
+        print(f"[Voice Alert] Speech synthesis warning: {e}")
+
+
+def trigger_voice_alert_async(message_text: str):
+    """Launches speech synthesis asynchronously in a separate background thread."""
+    t = threading.Thread(target=_speak_worker, args=(message_text,), daemon=True)
+    t.start()
+
 
 
 
@@ -238,9 +258,16 @@ if "angle_history" not in st.session_state:
     st.session_state.angle_history = []
 if "last_logged_reba_level" not in st.session_state:
     st.session_state.last_logged_reba_level = 0
+if "bend_timestamps" not in st.session_state:
+    st.session_state.bend_timestamps = []
+if "last_voice_time" not in st.session_state:
+    st.session_state.last_voice_time = 0.0
+if "was_bent" not in st.session_state:
+    st.session_state.was_bent = False
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())[:8]
+
 
 # Header Banner
 st.markdown("""
@@ -308,7 +335,11 @@ def render_sidebar_ui():
                 st.session_state.report_requested = False
                 st.session_state.angle_history = []
                 st.session_state.last_logged_reba_level = 0
+                st.session_state.bend_timestamps = []
+                st.session_state.last_voice_time = 0.0
+                st.session_state.was_bent = False
                 st.rerun()
+
 
         with col_report:
             if st.button("Generate Report", use_container_width=True, key=f"gen_report_btn_{time.time()}"):
@@ -470,7 +501,30 @@ if run_camera:
                     knee = [(l[LEFT_KNEE].x + l[RIGHT_KNEE].x)/2 * w, (l[LEFT_KNEE].y + l[RIGHT_KNEE].y)/2 * h]
                     current_angle = calculate_angle(shoulder, hip, knee)
 
+                # Track bend-overs for voice alert (>10 in 15s with 5s cooldown)
+                if current_angle is not None:
+                    now_ts = time.time()
+                    if current_angle < BENDING_REPETITIVE_THRESHOLD:
+                        if not st.session_state.was_bent:
+                            st.session_state.was_bent = True
+                            st.session_state.bend_timestamps.append(now_ts)
+                    elif current_angle > STANDING_ANGLE_THRESHOLD:
+                        st.session_state.was_bent = False
+
+                    # Filter timestamps to keep only entries from the last 15 seconds
+                    st.session_state.bend_timestamps = [
+                        t for t in st.session_state.bend_timestamps if now_ts - t <= 15.0
+                    ]
+
+                    # Trigger non-blocking voice alert if > 10 bend-overs occur in last 15s
+                    if len(st.session_state.bend_timestamps) > 10:
+                        if now_ts - st.session_state.last_voice_time >= 5.0:
+                            st.session_state.last_voice_time = now_ts
+                            trigger_voice_alert_async("Warning! High frequency repetitive bending detected. Please take a break.")
+                            st.toast("🚨 High Frequency Bending Alert!", icon="🔊")
+
                 # Check Repetitive Motion Risk & REBA Ergonomic Risk Score
+
                 rep_status, rep_cycles, st.session_state.angle_history = detect_repetitive_motion(
                     st.session_state.angle_history,
                     current_angle
