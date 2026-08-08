@@ -17,9 +17,13 @@ class PoseDetector:
 
     def process_frame(self, frame):
         """
-        Takes an OpenCV BGR frame, detects pose landmarks, 
+        Takes an OpenCV BGR frame, downscales if > 640x480, detects pose landmarks, 
         draws full-body skeleton overlay, and returns the modified frame.
         """
+        h, w = frame.shape[:2]
+        if w > 640 or h > 480:
+            frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
+
         # Convert frame color space from BGR to RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
@@ -36,3 +40,4 @@ class PoseDetector:
             )
 
         return frame, results.pose_landmarks
+

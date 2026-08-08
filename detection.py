@@ -51,9 +51,9 @@ class SafetyDetector:
         self.bend_start_time = None
 
     def draw_restricted_zone(self, frame):
-        """Draws the restricted zone rectangle outline and text label on the frame."""
+        """Draws the restricted zone rectangle outline and text label on the frame with zero drawing overhead."""
         x1, y1, x2, y2 = RESTRICTED_ZONE
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2, lineType=cv2.LINE_8)
         cv2.putText(
             frame,
             "RESTRICTED ZONE",
@@ -61,9 +61,11 @@ class SafetyDetector:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (0, 0, 255),
-            2
+            2,
+            lineType=cv2.LINE_8
         )
         return frame
+
 
     def detect(self, pose_landmarks, frame_width, frame_height):
         """

@@ -24,7 +24,10 @@ from detection import (
     LEFT_KNEE,
     RIGHT_KNEE
 )
+import uuid
 from reba_scoring import evaluate_reba_score
+from firebase_db import get_firebase_status, log_incident_to_firestore
+
 
 
 
@@ -236,6 +239,9 @@ if "angle_history" not in st.session_state:
 if "last_logged_reba_level" not in st.session_state:
     st.session_state.last_logged_reba_level = 0
 
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())[:8]
+
 # Header Banner
 st.markdown("""
 <div class="safety-header">
@@ -250,8 +256,28 @@ st.markdown("""
 st.sidebar.markdown("### ⚙️ SYSTEM CONTROLS")
 camera_index = st.sidebar.selectbox("Webcam Device Index", options=[0, 1, 2], index=0)
 run_camera = st.sidebar.checkbox("Start Camera Stream", value=False)
+fps_placeholder = st.sidebar.empty()
+
+
+# Cloud Sync Indicator Badge
+fb_connected = get_firebase_status()
+if fb_connected:
+    st.sidebar.markdown("""
+    <div style="background: rgba(16, 185, 129, 0.12); border: 1px solid #10b981; border-radius: 4px; padding: 6px 10px; font-family: 'IBM Plex Mono', monospace; font-size: 0.78rem; color: #34d399; margin-top: 8px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+        <span style="height: 8px; width: 8px; background-color: #10b981; border-radius: 50%; display: inline-block;"></span>
+        CLOUD SYNC: CONNECTED (FIRESTORE)
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.sidebar.markdown("""
+    <div style="background: rgba(107, 114, 128, 0.12); border: 1px solid #6b7280; border-radius: 4px; padding: 6px 10px; font-family: 'IBM Plex Mono', monospace; font-size: 0.78rem; color: #9ca3af; margin-top: 8px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+        <span style="height: 8px; width: 8px; background-color: #6b7280; border-radius: 50%; display: inline-block;"></span>
+        CLOUD SYNC: OFFLINE
+    </div>
+    """, unsafe_allow_html=True)
 
 st.sidebar.markdown("---")
+
 st.sidebar.markdown("### ⚠️ INCIDENT LOG")
 
 # Placeholders for Sidebar UI components (enables real-time updating during frame loop)
@@ -347,12 +373,29 @@ with col_metrics:
 
 report_container = st.container()
 
+def create_compressed_thumbnail(frame_img, quality=70):
+    """
+    Downscales frame to (160, 120) and encodes snapshot with JPEG quality 70 
+    to minimize RAM footprint and prevent UI redraw bottlenecks.
+    """
+    resized = cv2.resize(frame_img, (160, 120), interpolation=cv2.INTER_LINEAR)
+    success, encoded = cv2.imencode('.jpg', resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if success:
+        decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        return cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+    return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+
 # Frame Streaming Loop
 if run_camera:
     detector = PoseDetector()
     safety_detector = SafetyDetector()
     
     cap = cv2.VideoCapture(camera_index)
+    # OpenCV Hardware & Buffer Performance Optimizations
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
     if not cap.isOpened():
         col_stream.markdown(f"""
@@ -364,9 +407,11 @@ if run_camera:
         """, unsafe_allow_html=True)
     else:
         try:
-            while run_camera:
-                ret, frame = cap.read()
-                if not ret:
+            frame_count = 0
+            prev_time = time.time()
+            while cap.isOpened() and run_camera:
+                # Fast grab to discard stale hardware buffer frames
+                if not cap.grab():
                     col_stream.markdown("""
                     <div class="error-card">
                         <h4>⚠️ STREAM INTERRUPTED</h4>
@@ -374,6 +419,32 @@ if run_camera:
                     </div>
                     """, unsafe_allow_html=True)
                     break
+
+                frame_count += 1
+
+                # Frame-skipping: Process detection & UI rendering on every 3rd frame ONLY
+                if frame_count % 3 != 0:
+                    continue
+
+                ret, frame = cap.retrieve()
+                if not ret or frame is None:
+                    continue
+
+                # Calculate Live Processing FPS
+                curr_time = time.time()
+                fps = 1.0 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0.0
+                prev_time = curr_time
+
+                fps_placeholder.markdown(f"""
+                <div style="background: rgba(22, 27, 34, 0.8); border: 1px solid #30363d; border-radius: 4px; padding: 6px 10px; font-family: 'IBM Plex Mono', monospace; font-size: 0.78rem; color: #8b949e; margin-top: 6px; margin-bottom: 8px;">
+                    ⚡ PROCESSING SPEED: <span style="font-size: 0.95rem; font-weight: 700; color: #ffcc00;">{fps:.1f} FPS</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Resolution & Pre-Processing Downscaling to 640x480
+                fh, fw = frame.shape[:2]
+                if fw > 640 or fh > 480:
+                    frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
 
                 # Process frame with PoseDetector
                 annotated_frame, landmarks = detector.process_frame(frame)
@@ -425,8 +496,8 @@ if run_camera:
                 if status in unsafe_states and status != st.session_state.last_logged_status:
                     timestamp_str = datetime.now().strftime("%H:%M:%S")
                     
-                    # Create thumbnail image
-                    thumb_img = cv2.cvtColor(cv2.resize(annotated_frame, (160, 120)), cv2.COLOR_BGR2RGB)
+                    # Create JPEG-compressed thumbnail image
+                    thumb_img = create_compressed_thumbnail(annotated_frame)
                     
                     st.session_state.warning_log.insert(0, {
                         "id": len(st.session_state.warning_log) + 1,
@@ -436,9 +507,21 @@ if run_camera:
                         "thumbnail": thumb_img
                     })
                     st.session_state.last_logged_status = status
+
+                    # Trigger visual toast alert
+                    st.toast("⚠️ Unsafe Posture Detected!", icon="🚨")
                     
                     # Reactively refresh sidebar counter and log panel immediately
                     render_sidebar_ui()
+
+                    # Additional persistent write to Firestore
+                    log_incident_to_firestore({
+                        "timestamp": datetime.now().isoformat(),
+                        "incident_type": status,
+                        "back_angle": round(current_angle, 1) if current_angle is not None else None,
+                        "reba_scores": reba_res.to_dict() if reba_res is not None else None,
+                        "session_id": st.session_state.session_id
+                    })
                 elif status == "SAFE":
                     st.session_state.last_logged_status = "SAFE"
 
@@ -446,8 +529,9 @@ if run_camera:
                 if reba_res is not None:
                     if reba_res.action_level >= 2 and st.session_state.last_logged_reba_level < 2:
                         timestamp_str = datetime.now().strftime("%H:%M:%S")
-                        thumb_img = cv2.cvtColor(cv2.resize(annotated_frame, (160, 120)), cv2.COLOR_BGR2RGB)
+                        thumb_img = create_compressed_thumbnail(annotated_frame)
                         reba_status_code = "REBA_MEDIUM_RISK" if reba_res.action_level == 2 else "REBA_HIGH_RISK"
+
                         
                         st.session_state.warning_log.insert(0, {
                             "id": len(st.session_state.warning_log) + 1,
@@ -457,9 +541,24 @@ if run_camera:
                             "thumbnail": thumb_img
                         })
                         st.session_state.last_logged_reba_level = reba_res.action_level
+
+                        # Trigger visual toast alert
+                        st.toast("⚠️ Unsafe Posture Detected!", icon="🚨")
+
                         render_sidebar_ui()
+
+
+                        # Additional persistent write to Firestore
+                        log_incident_to_firestore({
+                            "timestamp": datetime.now().isoformat(),
+                            "incident_type": reba_status_code,
+                            "back_angle": round(current_angle, 1) if current_angle is not None else None,
+                            "reba_scores": reba_res.to_dict(),
+                            "session_id": st.session_state.session_id
+                        })
                     elif reba_res.action_level < 2:
                         st.session_state.last_logged_reba_level = reba_res.action_level
+
 
                 # Convert BGR frame to RGB for Streamlit image container
                 rgb_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
@@ -602,11 +701,13 @@ else:
         <p>Toggle "Start Camera Stream" in the sidebar controls to activate real-time monitoring.</p>
     </div>
     """, unsafe_allow_html=True)
+    fps_placeholder.empty()
     status_placeholder.empty()
     reba_card_placeholder.empty()
     angle_gauge_placeholder.empty()
     cycle_tracker_placeholder.empty()
     zone_status_placeholder.empty()
+
 
 
 
