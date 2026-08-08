@@ -8,6 +8,13 @@ WARNING_DURATION_THRESHOLD = 5.0      # Continuous seconds for POSTURE_WARNING (
 HIGH_RISK_DURATION_THRESHOLD = 15.0   # Continuous seconds for POSTURE_HIGH_RISK (Severe Risk)
 RESTRICTED_ZONE = (100, 100, 350, 350)  # Rectangular box (x_min, y_min, x_max, y_max) in pixels
 
+# Repetitive Motion Detection Constants
+STANDING_ANGLE_THRESHOLD = 130.0      # Degrees (angles above this indicate standing/upright)
+BENDING_REPETITIVE_THRESHOLD = 110.0  # Degrees (angles below this indicate bent torso for cycle)
+REPETITIVE_CYCLE_THRESHOLD = 10       # Complete bend-rise cycles required for risk flag
+REPETITIVE_WINDOW_SECONDS = 60.0      # Rolling time window in seconds
+
+
 # MediaPipe Pose Landmark Indices
 LEFT_SHOULDER = 11
 RIGHT_SHOULDER = 12
@@ -111,3 +118,48 @@ class SafetyDetector:
         else:
             self.bend_start_time = None
             return "SAFE"
+
+
+def detect_repetitive_motion(
+    angle_history,
+    current_angle,
+    current_time=None,
+    standing_threshold=STANDING_ANGLE_THRESHOLD,
+    bending_threshold=BENDING_REPETITIVE_THRESHOLD,
+    cycle_threshold=REPETITIVE_CYCLE_THRESHOLD,
+    window_seconds=REPETITIVE_WINDOW_SECONDS
+):
+    """
+    Tracks rolling history of torso angles over a 60-second window and detects bend-rise cycles.
+    A bend-rise cycle is a transition from standing (> 130°) to bent (< 110°) and back to standing (> 130°).
+    
+    Returns:
+      - status: 'REPETITIVE_MOTION_RISK' if cycle count >= cycle_threshold else None
+      - cycle_count: int count of completed bend-rise cycles within window_seconds
+      - angle_history: updated list of (timestamp, angle) pairs within window_seconds
+    """
+    if current_time is None:
+        current_time = time.time()
+
+    if current_angle is not None:
+        angle_history.append((current_time, current_angle))
+
+    # Auto-discard entries older than 60 seconds
+    angle_history = [entry for entry in angle_history if current_time - entry[0] <= window_seconds]
+
+    # Count completed bend-rise cycles
+    cycle_count = 0
+    state = "STANDING"
+
+    for _, angle in angle_history:
+        if state == "STANDING":
+            if angle < bending_threshold:
+                state = "BENT"
+        elif state == "BENT":
+            if angle > standing_threshold:
+                state = "STANDING"
+                cycle_count += 1
+
+    status = "REPETITIVE_MOTION_RISK" if cycle_count >= cycle_threshold else None
+    return status, cycle_count, angle_history
+

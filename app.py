@@ -8,10 +8,15 @@ from pose_detector import PoseDetector
 from detection import (
     SafetyDetector,
     calculate_angle,
+    detect_repetitive_motion,
     BENDING_ANGLE_THRESHOLD,
     WARNING_DURATION_THRESHOLD,
     HIGH_RISK_DURATION_THRESHOLD,
     RESTRICTED_ZONE,
+    STANDING_ANGLE_THRESHOLD,
+    BENDING_REPETITIVE_THRESHOLD,
+    REPETITIVE_CYCLE_THRESHOLD,
+    REPETITIVE_WINDOW_SECONDS,
     LEFT_SHOULDER,
     RIGHT_SHOULDER,
     LEFT_HIP,
@@ -19,6 +24,10 @@ from detection import (
     LEFT_KNEE,
     RIGHT_KNEE
 )
+from reba_scoring import evaluate_reba_score
+
+
+
 
 # Set Streamlit Page Config
 st.set_page_config(
@@ -222,6 +231,10 @@ if "last_logged_status" not in st.session_state:
     st.session_state.last_logged_status = "SAFE"
 if "report_requested" not in st.session_state:
     st.session_state.report_requested = False
+if "angle_history" not in st.session_state:
+    st.session_state.angle_history = []
+if "last_logged_reba_level" not in st.session_state:
+    st.session_state.last_logged_reba_level = 0
 
 # Header Banner
 st.markdown("""
@@ -267,6 +280,8 @@ def render_sidebar_ui():
                 st.session_state.warning_log = []
                 st.session_state.last_logged_status = "SAFE"
                 st.session_state.report_requested = False
+                st.session_state.angle_history = []
+                st.session_state.last_logged_reba_level = 0
                 st.rerun()
 
         with col_report:
@@ -289,6 +304,15 @@ def render_sidebar_ui():
                 elif status_code == "RESTRICTED_ZONE_ENTRY":
                     card_class = "zone-breach"
                     status_text = "🚨 RESTRICTED ZONE BREACH"
+                elif status_code == "REPETITIVE_MOTION_RISK":
+                    card_class = "high-risk"
+                    status_text = "🔁 REPETITIVE MOTION RISK (10+ cycles)"
+                elif status_code == "REBA_MEDIUM_RISK":
+                    card_class = "high-risk"
+                    status_text = "⚠️ REBA MEDIUM RISK (Level 2)"
+                elif status_code == "REBA_HIGH_RISK":
+                    card_class = "zone-breach"
+                    status_text = "🚨 REBA HIGH RISK (Level 3+)"
                 else:
                     card_class = "posture"
                     status_text = status_code
@@ -302,6 +326,7 @@ def render_sidebar_ui():
                 st.image(entry["thumbnail"], caption=f"Incident #{entry['id']}", use_container_width=True)
 
 
+
 # Render Initial Sidebar View
 render_sidebar_ui()
 
@@ -313,8 +338,12 @@ with col_stream:
 
 with col_metrics:
     status_placeholder = st.empty()
+    reba_card_placeholder = st.empty()
     angle_gauge_placeholder = st.empty()
+    cycle_tracker_placeholder = st.empty()
     zone_status_placeholder = st.empty()
+
+
 
 report_container = st.container()
 
@@ -355,10 +384,13 @@ if run_camera:
 
                 # Determine Safety Status & Calculate Back Angle
                 current_angle = None
+                rep_status = None
+                rep_cycles = 0
+
                 if landmarks is None:
-                    status = "NO_PERSON"
+                    base_status = "NO_PERSON"
                 else:
-                    status = safety_detector.detect(landmarks, w, h)
+                    base_status = safety_detector.detect(landmarks, w, h)
                     
                     # Calculate Back Angle using landmarks
                     l = landmarks.landmark
@@ -367,8 +399,29 @@ if run_camera:
                     knee = [(l[LEFT_KNEE].x + l[RIGHT_KNEE].x)/2 * w, (l[LEFT_KNEE].y + l[RIGHT_KNEE].y)/2 * h]
                     current_angle = calculate_angle(shoulder, hip, knee)
 
+                # Check Repetitive Motion Risk & REBA Ergonomic Risk Score
+                rep_status, rep_cycles, st.session_state.angle_history = detect_repetitive_motion(
+                    st.session_state.angle_history,
+                    current_angle
+                )
+
+                reba_res = evaluate_reba_score(
+                    landmarks,
+                    w,
+                    h,
+                    is_repetitive_risk=(rep_status == "REPETITIVE_MOTION_RISK")
+                )
+
+                # Determine overall status with precedence
+                if base_status in ["RESTRICTED_ZONE_ENTRY", "POSTURE_HIGH_RISK"]:
+                    status = base_status
+                elif rep_status == "REPETITIVE_MOTION_RISK":
+                    status = "REPETITIVE_MOTION_RISK"
+                else:
+                    status = base_status
+
                 # Log incident strictly on STATE TRANSITION to a new unsafe state
-                unsafe_states = ["POSTURE_WARNING", "POSTURE_HIGH_RISK", "RESTRICTED_ZONE_ENTRY"]
+                unsafe_states = ["POSTURE_WARNING", "POSTURE_HIGH_RISK", "RESTRICTED_ZONE_ENTRY", "REPETITIVE_MOTION_RISK"]
                 if status in unsafe_states and status != st.session_state.last_logged_status:
                     timestamp_str = datetime.now().strftime("%H:%M:%S")
                     
@@ -388,6 +441,25 @@ if run_camera:
                     render_sidebar_ui()
                 elif status == "SAFE":
                     st.session_state.last_logged_status = "SAFE"
+
+                # REBA Incident Logging (when action level crosses into Medium level 2 or High level 3+)
+                if reba_res is not None:
+                    if reba_res.action_level >= 2 and st.session_state.last_logged_reba_level < 2:
+                        timestamp_str = datetime.now().strftime("%H:%M:%S")
+                        thumb_img = cv2.cvtColor(cv2.resize(annotated_frame, (160, 120)), cv2.COLOR_BGR2RGB)
+                        reba_status_code = "REBA_MEDIUM_RISK" if reba_res.action_level == 2 else "REBA_HIGH_RISK"
+                        
+                        st.session_state.warning_log.insert(0, {
+                            "id": len(st.session_state.warning_log) + 1,
+                            "time": timestamp_str,
+                            "status": reba_status_code,
+                            "angle": round(current_angle, 1) if current_angle is not None else "N/A",
+                            "thumbnail": thumb_img
+                        })
+                        st.session_state.last_logged_reba_level = reba_res.action_level
+                        render_sidebar_ui()
+                    elif reba_res.action_level < 2:
+                        st.session_state.last_logged_reba_level = reba_res.action_level
 
                 # Convert BGR frame to RGB for Streamlit image container
                 rgb_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
@@ -412,6 +484,12 @@ if run_camera:
                         🚨 POSTURE HIGH RISK (SEVERE: 15s+)
                     </div>
                     """, unsafe_allow_html=True)
+                elif status == "REPETITIVE_MOTION_RISK":
+                    status_placeholder.markdown("""
+                    <div class="status-banner status-high-risk">
+                        🚨 REPETITIVE MOTION RISK DETECTED
+                    </div>
+                    """, unsafe_allow_html=True)
                 elif status == "RESTRICTED_ZONE_ENTRY":
                     status_placeholder.markdown("""
                     <div class="status-banner status-critical">
@@ -422,6 +500,46 @@ if run_camera:
                     status_placeholder.markdown("""
                     <div class="status-banner status-standby">
                         👤 STANDBY — NO WORKER DETECTED
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # Render REBA Ergonomic Assessment Panel
+                if reba_res is None:
+                    reba_card_placeholder.markdown("""
+                    <div class="gauge-card" style="border-top-color: #6b7280;">
+                        <div class="gauge-title">REBA ERGONOMIC ASSESSMENT</div>
+                        <div class="gauge-value" style="color: #6b7280;">--</div>
+                        <div class="gauge-meta">TRUNK: -- | NECK: -- | BONUS: --</div>
+                        <div class="gauge-meta" style="color: #6b7280; font-weight: 600; margin-top: 6px;">ACTION LEVEL: STANDBY</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    if reba_res.action_level == 0:
+                        level_color = "#10b981"  # Green
+                    elif reba_res.action_level == 1:
+                        level_color = "#eab308"  # Yellow
+                    elif reba_res.action_level == 2:
+                        level_color = "#ff6b00"  # Orange
+                    else:
+                        level_color = "#ef4444"  # Red
+
+                    reba_card_placeholder.markdown(f"""
+                    <div class="gauge-card" style="border-top-color: {level_color};">
+                        <div class="gauge-title">REBA ERGONOMIC ASSESSMENT</div>
+                        <div style="display: flex; align-items: baseline; justify-content: space-between;">
+                            <div class="gauge-value" style="color: {level_color}; font-size: 2.8rem;">
+                                {reba_res.combined_score} <span style="font-size: 1rem; color: #8b949e; font-weight: 500;">/ 12</span>
+                            </div>
+                            <div style="font-family: 'Oswald'; font-size: 1.1rem; color: {level_color}; font-weight: 700; text-transform: uppercase;">
+                                LVL {reba_res.action_level}
+                            </div>
+                        </div>
+                        <div style="font-family: 'IBM Plex Mono'; font-size: 0.8rem; color: #8b949e; margin-top: 2px;">
+                            TRUNK: {reba_res.trunk_score} | NECK: {reba_res.neck_score} | BONUS: +{reba_res.repetitive_bonus}
+                        </div>
+                        <div style="font-family: 'IBM Plex Sans'; font-size: 0.82rem; font-weight: 600; color: {level_color}; margin-top: 6px; padding: 4px 8px; background: rgba(22, 27, 34, 0.8); border: 1px solid {level_color}; border-radius: 4px;">
+                            ● {reba_res.action_label}
+                        </div>
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -449,6 +567,21 @@ if run_camera:
                 </div>
                 """, unsafe_allow_html=True)
 
+                # Render Motion Cycle Tracker Stat Card
+                cycle_color = "#ef4444" if rep_cycles >= REPETITIVE_CYCLE_THRESHOLD else ("#ff6b00" if rep_cycles >= 5 else "#10b981")
+                cycle_progress = min(int((rep_cycles / REPETITIVE_CYCLE_THRESHOLD) * 100), 100)
+
+                cycle_tracker_placeholder.markdown(f"""
+                <div class="gauge-card" style="border-top-color: #ff6b00;">
+                    <div class="gauge-title">MOTION CYCLE TRACKER</div>
+                    <div class="gauge-value" style="color: {cycle_color};">{rep_cycles} / {REPETITIVE_CYCLE_THRESHOLD} <span style="font-size: 1.1rem; color: #8b949e; font-weight: 500;">cycles</span></div>
+                    <div class="gauge-meta">ROLLING WINDOW: {REPETITIVE_WINDOW_SECONDS:.0f}s | RISK THRESHOLD: &ge;{REPETITIVE_CYCLE_THRESHOLD} CYCLES</div>
+                    <div style="background: #21262d; border-radius: 4px; height: 8px; margin-top: 10px; overflow: hidden;">
+                        <div style="background: {cycle_color}; width: {cycle_progress}%; height: 100%;"></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
                 # Zone Protection Readout Card
                 zone_status_placeholder.markdown(f"""
                 <div class="gauge-card" style="border-top-color: #ef4444;">
@@ -470,8 +603,12 @@ else:
     </div>
     """, unsafe_allow_html=True)
     status_placeholder.empty()
+    reba_card_placeholder.empty()
     angle_gauge_placeholder.empty()
+    cycle_tracker_placeholder.empty()
     zone_status_placeholder.empty()
+
+
 
 # Render Safety Incident Report section when warning count >= 3 or manually requested
 show_report = len(st.session_state.warning_log) >= 3 or st.session_state.report_requested
