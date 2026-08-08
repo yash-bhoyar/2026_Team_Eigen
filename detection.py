@@ -3,8 +3,9 @@ import cv2
 import numpy as np
 
 # Configurable Constants
-BENDING_ANGLE_THRESHOLD = 90.0      # Degrees (angles below this indicate stooping/bending)
-BENDING_DURATION_THRESHOLD = 2.0    # Continuous seconds before triggering UNSAFE_POSTURE
+BENDING_ANGLE_THRESHOLD = 90.0        # Degrees (angles below this indicate stooping/bending)
+WARNING_DURATION_THRESHOLD = 5.0      # Continuous seconds for POSTURE_WARNING (Moderate Risk)
+HIGH_RISK_DURATION_THRESHOLD = 15.0   # Continuous seconds for POSTURE_HIGH_RISK (Severe Risk)
 RESTRICTED_ZONE = (100, 100, 350, 350)  # Rectangular box (x_min, y_min, x_max, y_max) in pixels
 
 # MediaPipe Pose Landmark Indices
@@ -37,7 +38,7 @@ def calculate_angle(a, b, c):
 
 
 class SafetyDetector:
-    """Handles unsafe posture and restricted zone entry detection logic."""
+    """Handles unsafe posture severity tiers and restricted zone entry detection logic."""
 
     def __init__(self):
         self.bend_start_time = None
@@ -60,7 +61,11 @@ class SafetyDetector:
     def detect(self, pose_landmarks, frame_width, frame_height):
         """
         Evaluates pose landmarks against safety rules.
-        Returns 'RESTRICTED_ZONE_ENTRY', 'UNSAFE_POSTURE', or 'SAFE'.
+        Returns:
+          - 'RESTRICTED_ZONE_ENTRY': Core body landmark inside restricted box
+          - 'POSTURE_HIGH_RISK': Sustained stooping >= 15.0 seconds
+          - 'POSTURE_WARNING': Stooping >= 5.0 seconds but < 15.0 seconds
+          - 'SAFE': Normal posture or brief bending (< 5.0 seconds)
         """
         if not pose_landmarks:
             self.bend_start_time = None
@@ -82,20 +87,27 @@ class SafetyDetector:
         hip = [hip_x, hip_y]
         knee = [knee_x, knee_y]
 
-        # 1. Check Restricted Zone Entry (using Hip center point)
+        # 1. Check Restricted Zone Entry (Priority: Zone breach takes immediate precedence)
         x1, y1, x2, y2 = RESTRICTED_ZONE
         if x1 <= hip_x <= x2 and y1 <= hip_y <= y2:
             return "RESTRICTED_ZONE_ENTRY"
 
-        # 2. Check Bad Bending Posture (using torso/back angle at hip)
+        # 2. Check Bad Bending Posture Severity Tiers
         back_angle = calculate_angle(shoulder, hip, knee)
 
         if back_angle < BENDING_ANGLE_THRESHOLD:
             if self.bend_start_time is None:
                 self.bend_start_time = time.time()
-            elif time.time() - self.bend_start_time >= BENDING_DURATION_THRESHOLD:
-                return "UNSAFE_POSTURE"
+            
+            elapsed = time.time() - self.bend_start_time
+            
+            if elapsed >= HIGH_RISK_DURATION_THRESHOLD:
+                return "POSTURE_HIGH_RISK"
+            elif elapsed >= WARNING_DURATION_THRESHOLD:
+                return "POSTURE_WARNING"
+            else:
+                # Brief bend (< 5 seconds) is considered normal movement / safe
+                return "SAFE"
         else:
             self.bend_start_time = None
-
-        return "SAFE"
+            return "SAFE"

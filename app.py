@@ -9,7 +9,8 @@ from detection import (
     SafetyDetector,
     calculate_angle,
     BENDING_ANGLE_THRESHOLD,
-    BENDING_DURATION_THRESHOLD,
+    WARNING_DURATION_THRESHOLD,
+    HIGH_RISK_DURATION_THRESHOLD,
     RESTRICTED_ZONE,
     LEFT_SHOULDER,
     RIGHT_SHOULDER,
@@ -99,9 +100,15 @@ INDUSTRIAL_CSS = """
     color: #ff8c38;
 }
 
-.status-critical {
-    background-color: rgba(239, 68, 68, 0.15);
+.status-high-risk {
+    background-color: rgba(239, 68, 68, 0.2);
     border: 2px solid #ef4444;
+    color: #f87171;
+}
+
+.status-critical {
+    background-color: rgba(220, 38, 38, 0.25);
+    border: 2px solid #dc2626;
     color: #f87171;
 }
 
@@ -164,15 +171,19 @@ INDUSTRIAL_CSS = """
 .warning-log-card {
     background: #161b22;
     border: 1px solid #30363d;
-    border-left: 4px solid #ef4444;
+    border-left: 4px solid #ff6b00;
     border-radius: 4px;
     padding: 10px;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
     font-size: 0.85rem;
 }
 
-.warning-log-card.posture {
-    border-left-color: #ff6b00;
+.warning-log-card.high-risk {
+    border-left-color: #ef4444;
+}
+
+.warning-log-card.zone-breach {
+    border-left-color: #dc2626;
 }
 
 .warning-log-time {
@@ -204,23 +215,25 @@ INDUSTRIAL_CSS = """
 
 st.markdown(INDUSTRIAL_CSS, unsafe_allow_html=True)
 
-# Initialize Session State
+# Initialize Session State Variables
 if "warning_log" not in st.session_state:
     st.session_state.warning_log = []
 if "last_logged_status" not in st.session_state:
     st.session_state.last_logged_status = "SAFE"
+if "report_requested" not in st.session_state:
+    st.session_state.report_requested = False
 
 # Header Banner
 st.markdown("""
 <div class="safety-header">
     <div>
         <h1 class="safety-header-title">🛡️ SAFEGUARD // WORKER SAFETY MONITOR</h1>
-        <div class="safety-header-subtitle">REAL-TIME COMPUTER VISION ERGONOMIC & ZONE PROTECTION SYSTEM</div>
+        <div class="safety-header-subtitle">REAL-TIME ERGONOMIC POSTURE TIERS & ZONE PROTECTION SYSTEM</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-# Sidebar Controls & Log Panel
+# Sidebar System Controls
 st.sidebar.markdown("### ⚙️ SYSTEM CONTROLS")
 camera_index = st.sidebar.selectbox("Webcam Device Index", options=[0, 1, 2], index=0)
 run_camera = st.sidebar.checkbox("Start Camera Stream", value=False)
@@ -228,31 +241,71 @@ run_camera = st.sidebar.checkbox("Start Camera Stream", value=False)
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚠️ INCIDENT LOG")
 
-# Sidebar Counter
-warning_count = len(st.session_state.warning_log)
-st.sidebar.markdown(f"""
-<div class="warning-counter-box">
-    <div style="font-family: 'Oswald'; color: #8b949e; font-size: 0.85rem; letter-spacing: 1px;">TOTAL SESSION WARNINGS</div>
-    <div class="warning-counter-num">{warning_count}</div>
-</div>
-""", unsafe_allow_html=True)
+# Placeholders for Sidebar UI components (enables real-time updating during frame loop)
+sidebar_counter_placeholder = st.sidebar.empty()
+sidebar_actions_placeholder = st.sidebar.empty()
+sidebar_log_placeholder = st.sidebar.empty()
 
-# Sidebar Reset / Report Action Buttons
-col_reset, col_report = st.sidebar.columns(2)
-with col_reset:
-    if st.button("Clear Log", use_container_width=True):
-        st.session_state.warning_log = []
-        st.session_state.last_logged_status = "SAFE"
-        st.rerun()
 
-show_report_btn = warning_count >= 3
-with col_report:
-    generate_report = st.button("Generate Report", use_container_width=True)
+def render_sidebar_ui():
+    """Renders the reactive sidebar counter, action buttons, and thumbnail log list."""
+    warning_count = len(st.session_state.warning_log)
+    
+    # 1. Update Counter Badge
+    sidebar_counter_placeholder.markdown(f"""
+    <div class="warning-counter-box">
+        <div style="font-family: 'Oswald'; color: #8b949e; font-size: 0.85rem; letter-spacing: 1px;">TOTAL SESSION WARNINGS</div>
+        <div class="warning-counter-num">{warning_count}</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # 2. Render Action Buttons inside placeholder
+    with sidebar_actions_placeholder.container():
+        col_reset, col_report = st.columns(2)
+        with col_reset:
+            if st.button("Clear Log", use_container_width=True, key=f"clear_log_btn_{time.time()}"):
+                st.session_state.warning_log = []
+                st.session_state.last_logged_status = "SAFE"
+                st.session_state.report_requested = False
+                st.rerun()
 
-st.sidebar.markdown("---")
-sidebar_log_container = st.sidebar.container()
+        with col_report:
+            if st.button("Generate Report", use_container_width=True, key=f"gen_report_btn_{time.time()}"):
+                st.session_state.report_requested = True
 
-# Main Layout: 2 Columns (Stream on left, Instrument Panel on right)
+    # 3. Render Incident Thumbnail List
+    with sidebar_log_placeholder.container():
+        if not st.session_state.warning_log:
+            st.markdown("<div style='color: #8b949e; font-size: 0.85rem; text-align: center;'>No safety incidents logged.</div>", unsafe_allow_html=True)
+        else:
+            for entry in st.session_state.warning_log:
+                status_code = entry["status"]
+                if status_code == "POSTURE_WARNING":
+                    card_class = "posture"
+                    status_text = "⚠️ POSTURE WARNING (5s+)"
+                elif status_code == "POSTURE_HIGH_RISK":
+                    card_class = "high-risk"
+                    status_text = "🚨 HIGH RISK POSTURE (15s+)"
+                elif status_code == "RESTRICTED_ZONE_ENTRY":
+                    card_class = "zone-breach"
+                    status_text = "🚨 RESTRICTED ZONE BREACH"
+                else:
+                    card_class = "posture"
+                    status_text = status_code
+
+                st.markdown(f"""
+                <div class="warning-log-card {card_class}">
+                    <div class="warning-log-time">⏱️ {entry['time']}</div>
+                    <div class="warning-log-title">{status_text}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.image(entry["thumbnail"], caption=f"Incident #{entry['id']}", use_container_width=True)
+
+
+# Render Initial Sidebar View
+render_sidebar_ui()
+
+# Main Layout Columns (Stream on left, Instrument Panel on right)
 col_stream, col_metrics = st.columns([2.2, 1])
 
 with col_stream:
@@ -262,6 +315,8 @@ with col_metrics:
     status_placeholder = st.empty()
     angle_gauge_placeholder = st.empty()
     zone_status_placeholder = st.empty()
+
+report_container = st.container()
 
 # Frame Streaming Loop
 if run_camera:
@@ -312,21 +367,25 @@ if run_camera:
                     knee = [(l[LEFT_KNEE].x + l[RIGHT_KNEE].x)/2 * w, (l[LEFT_KNEE].y + l[RIGHT_KNEE].y)/2 * h]
                     current_angle = calculate_angle(shoulder, hip, knee)
 
-                # Cooldown / Warning Log Entry Logic (Only log when new unsafe status occurs)
-                if status in ["UNSAFE_POSTURE", "RESTRICTED_ZONE_ENTRY"] and status != st.session_state.last_logged_status:
+                # Log incident strictly on STATE TRANSITION to a new unsafe state
+                unsafe_states = ["POSTURE_WARNING", "POSTURE_HIGH_RISK", "RESTRICTED_ZONE_ENTRY"]
+                if status in unsafe_states and status != st.session_state.last_logged_status:
                     timestamp_str = datetime.now().strftime("%H:%M:%S")
                     
-                    # Downsample frame for thumbnail
+                    # Create thumbnail image
                     thumb_img = cv2.cvtColor(cv2.resize(annotated_frame, (160, 120)), cv2.COLOR_BGR2RGB)
                     
                     st.session_state.warning_log.insert(0, {
                         "id": len(st.session_state.warning_log) + 1,
                         "time": timestamp_str,
                         "status": status,
-                        "angle": round(current_angle, 1) if current_angle else "N/A",
+                        "angle": round(current_angle, 1) if current_angle is not None else "N/A",
                         "thumbnail": thumb_img
                     })
                     st.session_state.last_logged_status = status
+                    
+                    # Reactively refresh sidebar counter and log panel immediately
+                    render_sidebar_ui()
                 elif status == "SAFE":
                     st.session_state.last_logged_status = "SAFE"
 
@@ -341,10 +400,16 @@ if run_camera:
                         🟢 OPERATIONAL — SAFE
                     </div>
                     """, unsafe_allow_html=True)
-                elif status == "UNSAFE_POSTURE":
+                elif status == "POSTURE_WARNING":
                     status_placeholder.markdown("""
                     <div class="status-banner status-warning">
-                        ⚠️ UNSAFE POSTURE (STOOPING)
+                        ⚠️ POSTURE WARNING (MODERATE RISK: 5s+)
+                    </div>
+                    """, unsafe_allow_html=True)
+                elif status == "POSTURE_HIGH_RISK":
+                    status_placeholder.markdown("""
+                    <div class="status-banner status-high-risk">
+                        🚨 POSTURE HIGH RISK (SEVERE: 15s+)
                     </div>
                     """, unsafe_allow_html=True)
                 elif status == "RESTRICTED_ZONE_ENTRY":
@@ -362,15 +427,22 @@ if run_camera:
 
                 # Render Industrial Gauge / Angle Instrument Readout
                 angle_str = f"{current_angle:.1f}°" if current_angle is not None else "N/A"
-                angle_color = "#10b981" if (current_angle and current_angle >= BENDING_ANGLE_THRESHOLD) else "#ff6b00" if current_angle else "#6b7280"
+                if current_angle is None:
+                    angle_color = "#6b7280"
+                elif current_angle >= BENDING_ANGLE_THRESHOLD:
+                    angle_color = "#10b981"
+                elif status == "POSTURE_HIGH_RISK":
+                    angle_color = "#ef4444"
+                else:
+                    angle_color = "#ff6b00"
                 
-                progress_val = min(max(int((current_angle / 180.0) * 100), 0), 100) if current_angle else 0
+                progress_val = min(max(int((current_angle / 180.0) * 100), 0), 100) if current_angle is not None else 0
 
                 angle_gauge_placeholder.markdown(f"""
                 <div class="gauge-card">
                     <div class="gauge-title">TORSO / BACK ANGLE INSTRUMENT</div>
                     <div class="gauge-value" style="color: {angle_color};">{angle_str}</div>
-                    <div class="gauge-meta">SAFE THRESHOLD: &ge; {BENDING_ANGLE_THRESHOLD:.0f}&deg; | DURATION: &gt;{BENDING_DURATION_THRESHOLD}s</div>
+                    <div class="gauge-meta">THRESHOLD: &lt;{BENDING_ANGLE_THRESHOLD:.0f}&deg; | WARN: &gt;{WARNING_DURATION_THRESHOLD:.0f}s | SEVERE: &gt;{HIGH_RISK_DURATION_THRESHOLD:.0f}s</div>
                     <div style="background: #21262d; border-radius: 4px; height: 8px; margin-top: 10px; overflow: hidden;">
                         <div style="background: {angle_color}; width: {progress_val}%; height: 100%;"></div>
                     </div>
@@ -401,46 +473,32 @@ else:
     angle_gauge_placeholder.empty()
     zone_status_placeholder.empty()
 
-# Render Warning Log items in Sidebar
-with sidebar_log_container:
-    if not st.session_state.warning_log:
-        st.markdown("<div style='color: #8b949e; font-size: 0.85rem; text-align: center;'>No safety incidents logged.</div>", unsafe_allow_html=True)
-    else:
-        for entry in st.session_state.warning_log:
-            card_class = "posture" if entry["status"] == "UNSAFE_POSTURE" else "critical"
-            status_text = "UNSAFE POSTURE" if entry["status"] == "UNSAFE_POSTURE" else "ZONE BREACH"
-            
-            st.markdown(f"""
-            <div class="warning-log-card {card_class}">
-                <div class="warning-log-time">⏱️ {entry['time']}</div>
-                <div class="warning-log-title">{status_text}</div>
+# Render Safety Incident Report section when warning count >= 3 or manually requested
+show_report = len(st.session_state.warning_log) >= 3 or st.session_state.report_requested
+
+if show_report:
+    with report_container:
+        st.markdown("---")
+        st.markdown(f"""
+        <div style="background: #161b22; border: 2px solid #ffcc00; border-radius: 6px; padding: 20px; margin-top: 20px;">
+            <h2 style="font-family: 'Oswald'; color: #ffcc00; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 10px;">
+                📄 SAFETY INCIDENT REPORT
+            </h2>
+            <div style="font-family: 'IBM Plex Mono'; font-size: 0.85rem; color: #8b949e; margin-bottom: 20px;">
+                GENERATED AT: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | TOTAL INCIDENTS RECORDED: {len(st.session_state.warning_log)}
             </div>
-            """, unsafe_allow_html=True)
-            st.image(entry["thumbnail"], caption=f"Incident #{entry['id']}", use_container_width=True)
-
-# Render Safety Incident Report when triggered or when count >= 3
-if show_report_btn or generate_report:
-    st.markdown("---")
-    st.markdown(f"""
-    <div style="background: #161b22; border: 2px solid #ffcc00; border-radius: 6px; padding: 20px; margin-top: 20px;">
-        <h2 style="font-family: 'Oswald'; color: #ffcc00; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 10px;">
-            📄 SAFETY INCIDENT REPORT
-        </h2>
-        <div style="font-family: 'IBM Plex Mono'; font-size: 0.85rem; color: #8b949e; margin-bottom: 20px;">
-            GENERATED AT: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | TOTAL INCIDENTS RECORDED: {len(st.session_state.warning_log)}
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    if st.session_state.warning_log:
-        cols = st.columns(3)
-        for idx, entry in enumerate(st.session_state.warning_log):
-            with cols[idx % 3]:
-                st.markdown(f"""
-                <div style="background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin-top: 15px;">
-                    <div style="font-family: 'IBM Plex Mono'; font-size: 0.8rem; color: #ffcc00;">INCIDENT #{entry['id']} — {entry['time']}</div>
-                    <div style="font-family: 'Oswald'; font-size: 1.1rem; color: #f0f6fc; margin-top: 4px;">{entry['status']}</div>
-                    <div style="font-family: 'IBM Plex Mono'; font-size: 0.8rem; color: #8b949e;">Back Angle: {entry['angle']}°</div>
-                </div>
-                """, unsafe_allow_html=True)
-                st.image(entry["thumbnail"], use_container_width=True)
+        if st.session_state.warning_log:
+            cols = st.columns(3)
+            for idx, entry in enumerate(st.session_state.warning_log):
+                with cols[idx % 3]:
+                    st.markdown(f"""
+                    <div style="background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin-top: 15px;">
+                        <div style="font-family: 'IBM Plex Mono'; font-size: 0.8rem; color: #ffcc00;">INCIDENT #{entry['id']} — {entry['time']}</div>
+                        <div style="font-family: 'Oswald'; font-size: 1.1rem; color: #f0f6fc; margin-top: 4px;">{entry['status']}</div>
+                        <div style="font-family: 'IBM Plex Mono'; font-size: 0.8rem; color: #8b949e;">Back Angle: {entry['angle']}°</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.image(entry["thumbnail"], use_container_width=True)
